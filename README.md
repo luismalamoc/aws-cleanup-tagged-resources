@@ -19,6 +19,7 @@ This project is designed to safely clean ephemeral environments (for example: `s
 - Profile safety guard (`-dev` profiles by default)
 - Include/exclude AWS resource types
 - Multi-round deletion retries for dependency errors
+- Generic fallback for unmatched resource types via AWS Cloud Control API (enabled by default)
 
 Name matching safety:
 - In `tag-or-name` mode, the script checks only identity-like fields per resource
@@ -120,6 +121,7 @@ python3 aws-cleanup-tagged-resources.py \
 - `--allow-non-dev-profile`: disable `-dev` profile guard
 - `--max-rounds`: retry rounds for deferred deletions (default: `4`)
 - `--round-wait-seconds`: delay between rounds (default: `20`)
+- `--disable-generic-fallback`: disable generic delete attempts for resource types without dedicated handlers
 
 ## Safety Notes
 
@@ -127,12 +129,15 @@ python3 aws-cleanup-tagged-resources.py \
 - Start with narrow `--include-types` when testing.
 - Use least-privilege credentials and explicit profiles.
 - Deletions in AWS can be asynchronous. Re-run if needed.
+- By default, matched resource types without a dedicated handler are attempted with AWS Cloud Control API so they are not silently excluded.
+- Some AWS resource types are inherently non-deletable or require service-specific teardown; those will be reported as failed/deferred rather than skipped.
 
 ## Supported Resource Types
 
 Current handlers include:
 
 - `AWS::ECS::Service`
+- `AWS::ECS::TaskDefinition`
 - `AWS::AutoScaling::AutoScalingGroup`
 - `AWS::EC2::Instance`
 - `AWS::Lambda::Function`
@@ -142,6 +147,8 @@ Current handlers include:
 - `AWS::ElasticLoadBalancingV2::LoadBalancer`
 - `AWS::ElasticLoadBalancingV2::TargetGroup`
 - `AWS::ECS::Cluster`
+- `AWS::EKS::Nodegroup`
+- `AWS::EKS::FargateProfile`
 - `AWS::EKS::Cluster`
 - `AWS::ElastiCache::ReplicationGroup`
 - `AWS::ElastiCache::CacheCluster`

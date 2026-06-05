@@ -59,11 +59,33 @@ RETRYABLE_ERROR_CODES: Set[str] = {
     "ThrottlingException",
 }
 
+GENERIC_IDENTIFIER_KEYS: Tuple[str, ...] = (
+    "Arn",
+    "ARN",
+    "Id",
+    "ID",
+    "Name",
+    "ResourceArn",
+    "TaskDefinitionArn",
+    "ClusterName",
+    "ServiceName",
+    "NodegroupName",
+    "FargateProfileName",
+    "FunctionName",
+    "LogGroupName",
+    "QueueUrl",
+    "TopicArn",
+    "DBInstanceIdentifier",
+    "RepositoryName",
+    "BucketName",
+)
+
 # Identity-like fields used for name matching in --match-mode tag-or-name.
 # This intentionally avoids scanning every scalar property to reduce false positives
 # (for example, matching an RDS instance by MonitoringRoleArn).
 RESOURCE_NAME_MATCH_FIELDS: Dict[str, Tuple[str, ...]] = {
     "AWS::ECS::Service": ("ServiceName", "Name", "ServiceArn", "Cluster"),
+    "AWS::ECS::TaskDefinition": ("TaskDefinitionArn", "Arn", "Family", "Revision"),
     "AWS::AutoScaling::AutoScalingGroup": ("AutoScalingGroupName",),
     "AWS::EC2::Instance": ("InstanceId", "PrivateDnsName"),
     "AWS::Lambda::Function": ("FunctionName", "FunctionArn", "Name"),
@@ -74,6 +96,8 @@ RESOURCE_NAME_MATCH_FIELDS: Dict[str, Tuple[str, ...]] = {
     "AWS::ElasticLoadBalancingV2::TargetGroup": ("TargetGroupArn", "TargetGroupName"),
     "AWS::ECS::Cluster": ("ClusterName", "Arn"),
     "AWS::EKS::Cluster": ("Name", "Arn"),
+    "AWS::EKS::Nodegroup": ("NodegroupName", "NodegroupArn", "ClusterName", "Arn"),
+    "AWS::EKS::FargateProfile": ("FargateProfileName", "FargateProfileArn", "ClusterName", "Arn"),
     "AWS::ElastiCache::ReplicationGroup": ("ReplicationGroupId", "ARN"),
     "AWS::ElastiCache::CacheCluster": ("CacheClusterId", "ClusterName", "ARN"),
     "AWS::RDS::DBInstance": ("DBInstanceIdentifier", "DBName", "DBInstanceArn"),
@@ -196,6 +220,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help="Wait between rounds when deferred tasks remain.",
+    )
+    parser.add_argument(
+        "--disable-generic-fallback",
+        action="store_true",
+        help="Disable generic delete attempts for matched resource types without specific handlers.",
     )
     return parser.parse_args()
 
@@ -372,6 +401,56 @@ def name_match_candidates(record: InventoryRecord) -> List[str]:
     return deduped
 
 
+def generic_identifier_candidates(record: InventoryRecord) -> List[str]:
+    candidates: List[str] = []
+
+    def add(value: Any) -> None:
+        text = get_string(value).strip()
+        if not text:
+            return
+        if len(text) > 1024:
+            return
+        candidates.append(text)
+
+    add(record.resource_key)
+    if "|" in record.resource_key:
+        add(record.resource_key.split("|", 1)[0])
+
+    for field in RESOURCE_NAME_MATCH_FIELDS.get(record.resource_type, ()):
+        raw = record.properties.get(field)
+        if raw is None:
+            continue
+        if isinstance(raw, list):
+            for item in raw:
+                add(item)
+        else:
+            add(raw)
+
+    for field in GENERIC_IDENTIFIER_KEYS:
+        if field not in record.properties:
+            continue
+        raw = record.properties.get(field)
+        if isinstance(raw, list):
+            for item in raw:
+                add(item)
+        else:
+            add(raw)
+
+    for value in iter_scalar_strings(record.properties):
+        if value.startswith("arn:"):
+            add(value)
+
+    # Deduplicate while preserving order.
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for value in candidates:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
 def stage_regex(stage_value: str) -> re.Pattern[str]:
     escaped = re.escape(stage_value.lower())
     return re.compile(rf"(^|[^a-z0-9]){escaped}([^a-z0-9]|$)")
@@ -436,7 +515,35 @@ def parse_cluster_service_from_arn(service_arn: str) -> Tuple[str, str]:
     return "", ""
 
 
-def task_from_record(record: InventoryRecord, reason: str) -> Optional[DeletionTask]:
+def parse_eks_nodegroup_from_arn(nodegroup_arn: str) -> Tuple[str, str]:
+    # arn:aws:eks:region:account:nodegroup/<cluster>/<nodegroup>/<id>
+    marker = ":nodegroup/"
+    if marker not in nodegroup_arn:
+        return "", ""
+    suffix = nodegroup_arn.split(marker, 1)[1]
+    parts = suffix.split("/")
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return "", ""
+
+
+def parse_eks_fargate_profile_from_arn(profile_arn: str) -> Tuple[str, str]:
+    # arn:aws:eks:region:account:fargateprofile/<cluster>/<profile>/<id>
+    marker = ":fargateprofile/"
+    if marker not in profile_arn:
+        return "", ""
+    suffix = profile_arn.split(marker, 1)[1]
+    parts = suffix.split("/")
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return "", ""
+
+
+def task_from_record(
+    record: InventoryRecord,
+    reason: str,
+    allow_generic_fallback: bool,
+) -> Optional[DeletionTask]:
     resource_type = record.resource_type
     props = record.properties
     key = record.resource_key
@@ -458,6 +565,20 @@ def task_from_record(record: InventoryRecord, reason: str) -> Optional[DeletionT
             handler_name="delete_ecs_service",
             priority=10,
             payload={"cluster": cluster, "service": service_name},
+            match_reason=reason,
+        )
+
+    if resource_type == "AWS::ECS::TaskDefinition":
+        task_definition_arn = pick_first(props, "TaskDefinitionArn", "Arn", default=key.split("|", 1)[0])
+        if not task_definition_arn:
+            return None
+        return DeletionTask(
+            region=record.region,
+            resource_type=resource_type,
+            resource_key=key,
+            handler_name="delete_ecs_task_definition",
+            priority=72,
+            payload={"task_definition": task_definition_arn},
             match_reason=reason,
         )
 
@@ -581,6 +702,54 @@ def task_from_record(record: InventoryRecord, reason: str) -> Optional[DeletionT
             match_reason=reason,
         )
 
+    if resource_type == "AWS::EKS::Nodegroup":
+        cluster_name = pick_first(props, "ClusterName", "clusterName")
+        nodegroup_name = pick_first(props, "NodegroupName", "nodegroupName", "Name")
+        nodegroup_arn = pick_first(props, "NodegroupArn", "Arn", default=key.split("|", 1)[0])
+        if not cluster_name or not nodegroup_name:
+            parsed_cluster, parsed_nodegroup = parse_eks_nodegroup_from_arn(nodegroup_arn)
+            cluster_name = cluster_name or parsed_cluster
+            nodegroup_name = nodegroup_name or parsed_nodegroup
+        if (not cluster_name or not nodegroup_name) and "|" in key:
+            left, right = key.split("|", 1)
+            cluster_name = cluster_name or left
+            nodegroup_name = nodegroup_name or right
+        if not cluster_name or not nodegroup_name:
+            return None
+        return DeletionTask(
+            region=record.region,
+            resource_type=resource_type,
+            resource_key=key,
+            handler_name="delete_eks_nodegroup",
+            priority=73,
+            payload={"cluster_name": cluster_name, "nodegroup_name": nodegroup_name},
+            match_reason=reason,
+        )
+
+    if resource_type == "AWS::EKS::FargateProfile":
+        cluster_name = pick_first(props, "ClusterName", "clusterName")
+        profile_name = pick_first(props, "FargateProfileName", "fargateProfileName", "Name")
+        profile_arn = pick_first(props, "FargateProfileArn", "Arn", default=key.split("|", 1)[0])
+        if not cluster_name or not profile_name:
+            parsed_cluster, parsed_profile = parse_eks_fargate_profile_from_arn(profile_arn)
+            cluster_name = cluster_name or parsed_cluster
+            profile_name = profile_name or parsed_profile
+        if (not cluster_name or not profile_name) and "|" in key:
+            left, right = key.split("|", 1)
+            cluster_name = cluster_name or left
+            profile_name = profile_name or right
+        if not cluster_name or not profile_name:
+            return None
+        return DeletionTask(
+            region=record.region,
+            resource_type=resource_type,
+            resource_key=key,
+            handler_name="delete_eks_fargate_profile",
+            priority=74,
+            payload={"cluster_name": cluster_name, "fargate_profile_name": profile_name},
+            match_reason=reason,
+        )
+
     if resource_type == "AWS::ElastiCache::ReplicationGroup":
         repl_id = pick_first(props, "ReplicationGroupId", default=key)
         return DeletionTask(
@@ -664,6 +833,22 @@ def task_from_record(record: InventoryRecord, reason: str) -> Optional[DeletionT
             payload={"bucket_name": bucket},
             match_reason=reason,
         )
+
+    if allow_generic_fallback:
+        identifiers = generic_identifier_candidates(record)
+        if identifiers:
+            return DeletionTask(
+                region=record.region,
+                resource_type=resource_type,
+                resource_key=key,
+                handler_name="delete_generic_resource",
+                priority=900,
+                payload={
+                    "type_name": resource_type,
+                    "identifiers_json": json.dumps(identifiers),
+                },
+                match_reason=reason,
+            )
 
     return None
 
@@ -864,6 +1049,27 @@ def delete_ecs_service(ctx: DeleteContext, task: DeletionTask) -> DeletionResult
         return make_result("failed", f"ECS service {cluster}/{service}: {code}")
 
 
+def delete_ecs_task_definition(ctx: DeleteContext, task: DeletionTask) -> DeletionResult:
+    task_definition = task.payload["task_definition"]
+    if ctx.dry_run:
+        return make_result("planned", f"Deregister ECS task definition {task_definition}")
+
+    ecs = ctx.client("ecs", task.region)
+    try:
+        ecs.deregister_task_definition(taskDefinition=task_definition)
+        return make_result("deleted", f"Deregistered ECS task definition {task_definition}")
+    except ClientError as exc:
+        code = get_error_code(exc)
+        message = get_string(exc.response.get("Error", {}).get("Message", "")).lower()
+        if code in {"ClientException", "InvalidParameterException"} and (
+            "unable to describe" in message or "not found" in message or "inactive" in message
+        ):
+            return make_result("skipped", f"ECS task definition already inactive/missing: {task_definition}")
+        if is_retryable(exc):
+            return make_result("deferred", f"ECS task definition {task_definition}: {code}")
+        return make_result("failed", f"ECS task definition {task_definition}: {code}")
+
+
 def list_ecs_pages(ecs: Any, method: str, key: str, cluster: str) -> List[str]:
     items: List[str] = []
     token: Optional[str] = None
@@ -970,6 +1176,44 @@ def delete_eks_cluster(ctx: DeleteContext, task: DeletionTask) -> DeletionResult
                 note += f" (child deletes requested: {deleted_children})"
             return make_result("deferred", note)
         return make_result("failed", f"EKS cluster {cluster}: {code}")
+
+
+def delete_eks_nodegroup(ctx: DeleteContext, task: DeletionTask) -> DeletionResult:
+    cluster_name = task.payload["cluster_name"]
+    nodegroup_name = task.payload["nodegroup_name"]
+    if ctx.dry_run:
+        return make_result("planned", f"Delete EKS nodegroup {cluster_name}/{nodegroup_name}")
+
+    eks = ctx.client("eks", task.region)
+    try:
+        eks.delete_nodegroup(clusterName=cluster_name, nodegroupName=nodegroup_name)
+        return make_result("deleted", f"Deletion requested for EKS nodegroup {cluster_name}/{nodegroup_name}")
+    except ClientError as exc:
+        code = get_error_code(exc)
+        if code == "ResourceNotFoundException":
+            return make_result("skipped", f"EKS nodegroup already deleted: {cluster_name}/{nodegroup_name}")
+        if is_retryable(exc):
+            return make_result("deferred", f"EKS nodegroup {cluster_name}/{nodegroup_name}: {code}")
+        return make_result("failed", f"EKS nodegroup {cluster_name}/{nodegroup_name}: {code}")
+
+
+def delete_eks_fargate_profile(ctx: DeleteContext, task: DeletionTask) -> DeletionResult:
+    cluster_name = task.payload["cluster_name"]
+    profile_name = task.payload["fargate_profile_name"]
+    if ctx.dry_run:
+        return make_result("planned", f"Delete EKS fargate profile {cluster_name}/{profile_name}")
+
+    eks = ctx.client("eks", task.region)
+    try:
+        eks.delete_fargate_profile(clusterName=cluster_name, fargateProfileName=profile_name)
+        return make_result("deleted", f"Deletion requested for EKS fargate profile {cluster_name}/{profile_name}")
+    except ClientError as exc:
+        code = get_error_code(exc)
+        if code == "ResourceNotFoundException":
+            return make_result("skipped", f"EKS fargate profile already deleted: {cluster_name}/{profile_name}")
+        if is_retryable(exc):
+            return make_result("deferred", f"EKS fargate profile {cluster_name}/{profile_name}: {code}")
+        return make_result("failed", f"EKS fargate profile {cluster_name}/{profile_name}: {code}")
 
 
 def delete_elasticache_replication_group(ctx: DeleteContext, task: DeletionTask) -> DeletionResult:
@@ -1171,6 +1415,104 @@ def delete_s3_bucket(ctx: DeleteContext, task: DeletionTask) -> DeletionResult:
         return make_result("failed", f"S3 bucket {bucket}: {code}")
 
 
+def wait_cloudcontrol_delete(
+    cloudcontrol: Any,
+    request_token: str,
+    timeout_seconds: int = 180,
+    poll_seconds: int = 5,
+) -> Tuple[str, str, str]:
+    max_attempts = max(1, timeout_seconds // max(1, poll_seconds))
+    for _ in range(max_attempts):
+        response = cloudcontrol.get_resource_request_status(RequestToken=request_token)
+        event = response.get("ProgressEvent", {})
+        status = get_string(event.get("OperationStatus")).strip()
+        message = get_string(event.get("StatusMessage")).strip()
+        error_code = get_string(event.get("ErrorCode")).strip()
+
+        if status in {"SUCCESS", "FAILED", "CANCEL_COMPLETE"}:
+            return status, error_code, message
+
+        time.sleep(max(1, poll_seconds))
+
+    return "TIMEOUT", "Timeout", "Timed out waiting for Cloud Control delete status"
+
+
+def delete_generic_resource(ctx: DeleteContext, task: DeletionTask) -> DeletionResult:
+    type_name = task.payload["type_name"]
+    identifiers_raw = task.payload.get("identifiers_json", "[]")
+    try:
+        identifiers = json.loads(identifiers_raw)
+    except json.JSONDecodeError:
+        identifiers = []
+    if not isinstance(identifiers, list):
+        identifiers = []
+    identifiers = [get_string(item).strip() for item in identifiers if get_string(item).strip()]
+
+    if not identifiers:
+        return make_result("failed", f"No candidate identifiers found for {type_name}")
+
+    if ctx.dry_run:
+        preview = identifiers[0]
+        return make_result("planned", f"Generic delete {type_name} using identifier {preview}")
+
+    cloudcontrol = ctx.client("cloudcontrol", task.region)
+    had_not_found = False
+    last_error = ""
+
+    for identifier in identifiers:
+        try:
+            response = cloudcontrol.delete_resource(TypeName=type_name, Identifier=identifier)
+            event = response.get("ProgressEvent", {})
+            request_token = get_string(event.get("RequestToken", "")).strip()
+            if not request_token:
+                return make_result("failed", f"Cloud Control returned no request token for {type_name}:{identifier}")
+
+            status, error_code, message = wait_cloudcontrol_delete(cloudcontrol, request_token)
+            message_lower = message.lower()
+
+            if status == "SUCCESS":
+                return make_result("deleted", f"Deleted {type_name} via Cloud Control ({identifier})")
+
+            if status in {"FAILED", "CANCEL_COMPLETE"}:
+                if error_code in {"NotFound", "ResourceNotFound", "NotFoundException", "ResourceNotFoundException"}:
+                    had_not_found = True
+                    continue
+                if "not found" in message_lower:
+                    had_not_found = True
+                    continue
+                if error_code in {"AlreadyExists", "AlreadyDeleted"}:
+                    return make_result("skipped", f"Resource already deleted for {type_name}:{identifier}")
+                last_error = f"{error_code or status}: {message or 'Cloud Control delete failed'}"
+                continue
+
+            if status == "TIMEOUT":
+                return make_result("deferred", f"Timed out deleting {type_name}:{identifier}")
+
+            last_error = f"Unexpected status {status} for {type_name}:{identifier}"
+            continue
+
+        except ClientError as exc:
+            code = get_error_code(exc)
+            message = get_string(exc.response.get("Error", {}).get("Message", ""))
+            if code in {"ResourceNotFoundException", "NotFoundException", "NotFound"}:
+                had_not_found = True
+                continue
+            if is_retryable(exc):
+                return make_result("deferred", f"Generic delete {type_name}:{identifier}: {code}")
+            if code in {"ValidationException", "InvalidRequestException", "GeneralServiceException"}:
+                last_error = f"{code}: {message}"
+                continue
+            return make_result("failed", f"Generic delete {type_name}:{identifier}: {code}")
+
+    if had_not_found and not last_error:
+        return make_result("skipped", f"{type_name} already deleted or not found")
+    if had_not_found and last_error:
+        return make_result("failed", f"{type_name}: {last_error}")
+    if last_error:
+        return make_result("failed", f"{type_name}: {last_error}")
+    return make_result("failed", f"Generic delete failed for {type_name}")
+
+
 DELETE_HANDLERS: Dict[str, Callable[[DeleteContext, DeletionTask], DeletionResult]] = {
     "delete_autoscaling_group": delete_autoscaling_group,
     "delete_ec2_instance": delete_ec2_instance,
@@ -1181,7 +1523,10 @@ DELETE_HANDLERS: Dict[str, Callable[[DeleteContext, DeletionTask], DeletionResul
     "delete_elbv2_load_balancer": delete_elbv2_load_balancer,
     "delete_elbv2_target_group": delete_elbv2_target_group,
     "delete_ecs_service": delete_ecs_service,
+    "delete_ecs_task_definition": delete_ecs_task_definition,
     "delete_ecs_cluster": delete_ecs_cluster,
+    "delete_eks_nodegroup": delete_eks_nodegroup,
+    "delete_eks_fargate_profile": delete_eks_fargate_profile,
     "delete_eks_cluster": delete_eks_cluster,
     "delete_elasticache_replication_group": delete_elasticache_replication_group,
     "delete_elasticache_cluster": delete_elasticache_cluster,
@@ -1190,6 +1535,7 @@ DELETE_HANDLERS: Dict[str, Callable[[DeleteContext, DeletionTask], DeletionResul
     "delete_opensearch_domain": delete_opensearch_domain,
     "delete_elasticsearch_domain": delete_elasticsearch_domain,
     "delete_s3_bucket": delete_s3_bucket,
+    "delete_generic_resource": delete_generic_resource,
 }
 
 
@@ -1279,6 +1625,7 @@ def main() -> None:
     tag_keys = parse_tag_keys(args.tag_keys)
     include_types = parse_csv_set(args.include_types)
     exclude_types = parse_csv_set(args.exclude_types)
+    allow_generic_fallback = not args.disable_generic_fallback
 
     input_path = resolve_path(args.input, Path(args.results_dir), "--input")
     inventory = load_inventory(input_path)
@@ -1315,7 +1662,7 @@ def main() -> None:
     tasks: List[DeletionTask] = []
     unsupported: List[InventoryRecord] = []
     for record, reason in matched_records:
-        task = task_from_record(record, reason)
+        task = task_from_record(record, reason, allow_generic_fallback=allow_generic_fallback)
         if task is None:
             unsupported.append(record)
         else:
