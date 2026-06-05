@@ -140,6 +140,7 @@ class DeleteContext:
     profile: str
     default_region: str
     dry_run: bool
+    cloudcontrol_progress_seconds: int
     clients: Dict[str, Any]
 
     def client(self, service_name: str, region: str) -> Any:
@@ -225,6 +226,15 @@ def parse_args() -> argparse.Namespace:
         "--disable-generic-fallback",
         action="store_true",
         help="Disable generic delete attempts for matched resource types without specific handlers.",
+    )
+    parser.add_argument(
+        "--cloudcontrol-progress-seconds",
+        type=int,
+        default=15,
+        help=(
+            "Print progress while waiting for Cloud Control deletes every N seconds "
+            "(0 disables progress logs)."
+        ),
     )
     return parser.parse_args()
 
@@ -1420,8 +1430,12 @@ def wait_cloudcontrol_delete(
     request_token: str,
     timeout_seconds: int = 180,
     poll_seconds: int = 5,
+    progress_interval_seconds: int = 0,
+    progress_label: str = "",
 ) -> Tuple[str, str, str]:
     max_attempts = max(1, timeout_seconds // max(1, poll_seconds))
+    start_time = time.monotonic()
+    next_progress = max(1, progress_interval_seconds) if progress_interval_seconds > 0 else 0
     for _ in range(max_attempts):
         response = cloudcontrol.get_resource_request_status(RequestToken=request_token)
         event = response.get("ProgressEvent", {})
@@ -1431,6 +1445,17 @@ def wait_cloudcontrol_delete(
 
         if status in {"SUCCESS", "FAILED", "CANCEL_COMPLETE"}:
             return status, error_code, message
+
+        if next_progress:
+            elapsed_seconds = int(time.monotonic() - start_time)
+            if elapsed_seconds >= next_progress:
+                label = f" ({progress_label})" if progress_label else ""
+                short_token = request_token[:12] if request_token else "unknown"
+                log(
+                    "Cloud Control delete in progress"
+                    f"{label}: status={status or 'IN_PROGRESS'}, elapsed={elapsed_seconds}s, token={short_token}..."
+                )
+                next_progress += max(1, progress_interval_seconds)
 
         time.sleep(max(1, poll_seconds))
 
@@ -1467,13 +1492,26 @@ def delete_generic_resource(ctx: DeleteContext, task: DeletionTask) -> DeletionR
             if not request_token:
                 return make_result("failed", f"Cloud Control returned no request token for {type_name}:{identifier}")
 
-            status, error_code, message = wait_cloudcontrol_delete(cloudcontrol, request_token)
+            progress_label = f"{type_name}:{identifier}"
+            log(f"Cloud Control delete started for {progress_label} (request token: {request_token})")
+
+            status, error_code, message = wait_cloudcontrol_delete(
+                cloudcontrol,
+                request_token,
+                progress_interval_seconds=max(0, ctx.cloudcontrol_progress_seconds),
+                progress_label=progress_label,
+            )
             message_lower = message.lower()
 
             if status == "SUCCESS":
+                log(f"Cloud Control delete finished for {progress_label} with status=SUCCESS")
                 return make_result("deleted", f"Deleted {type_name} via Cloud Control ({identifier})")
 
             if status in {"FAILED", "CANCEL_COMPLETE"}:
+                log(
+                    f"Cloud Control delete finished for {progress_label} "
+                    f"with status={status}, error_code={error_code or 'none'}"
+                )
                 if error_code in {"NotFound", "ResourceNotFound", "NotFoundException", "ResourceNotFoundException"}:
                     had_not_found = True
                     continue
@@ -1486,6 +1524,7 @@ def delete_generic_resource(ctx: DeleteContext, task: DeletionTask) -> DeletionR
                 continue
 
             if status == "TIMEOUT":
+                log(f"Cloud Control delete timed out for {progress_label}")
                 return make_result("deferred", f"Timed out deleting {type_name}:{identifier}")
 
             last_error = f"Unexpected status {status} for {type_name}:{identifier}"
@@ -1584,11 +1623,23 @@ def run_delete_rounds(
         next_pending: List[DeletionTask] = []
         progressed = 0
 
-        for task in pending:
+        total_in_round = len(pending)
+        for task_idx, task in enumerate(pending, start=1):
+            label = f"{task.resource_type} [{task.region}] {task.resource_key}"
+            log(
+                f"Task start {task_idx}/{total_in_round} in round {round_idx}/{max_rounds}: "
+                f"{label} (handler={task.handler_name})"
+            )
+            started_at = time.monotonic()
             handler = DELETE_HANDLERS[task.handler_name]
             result = handler(ctx, task)
+            elapsed = time.monotonic() - started_at
             stats[result.status] += 1
             print(f"[{result.status.upper():8}] {task.resource_type} [{task.region}] {task.resource_key} | {result.message}")
+            log(
+                f"Task end {task_idx}/{total_in_round} in round {round_idx}/{max_rounds}: "
+                f"{label} status={result.status} duration={elapsed:.1f}s"
+            )
 
             if result.status in {"deleted", "skipped", "planned"}:
                 progressed += 1
@@ -1681,6 +1732,7 @@ def main() -> None:
         profile=args.profile,
         default_region=args.region,
         dry_run=not args.apply,
+        cloudcontrol_progress_seconds=max(0, args.cloudcontrol_progress_seconds),
         clients={},
     )
 

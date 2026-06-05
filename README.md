@@ -122,6 +122,7 @@ python3 aws-cleanup-tagged-resources.py \
 - `--max-rounds`: retry rounds for deferred deletions (default: `4`)
 - `--round-wait-seconds`: delay between rounds (default: `20`)
 - `--disable-generic-fallback`: disable generic delete attempts for resource types without dedicated handlers
+- `--cloudcontrol-progress-seconds`: print Cloud Control polling progress every N seconds (default: `15`, set `0` to disable)
 
 ## Safety Notes
 
