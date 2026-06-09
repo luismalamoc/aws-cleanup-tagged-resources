@@ -30,6 +30,42 @@ except ImportError as exc:
     print("Missing dependency: boto3. Install with: pip install -r requirements.txt", file=sys.stderr)
     raise SystemExit(1) from exc
 
+try:
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress as RichProgress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+    from rich.table import Table
+    RICH_UI = True
+except ImportError:
+    Console = None  # type: ignore[assignment]
+    Table = None  # type: ignore[assignment]
+    RichProgress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    BarColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    MofNCompleteColumn = None  # type: ignore[assignment]
+    RICH_UI = False
+
+
+STDOUT_CONSOLE = Console(highlight=False) if Console else None
+STDERR_CONSOLE = Console(stderr=True, highlight=False) if Console else None
+
+STATUS_STYLES: Dict[str, str] = {
+    "planned": "cyan",
+    "deleted": "green",
+    "skipped": "yellow",
+    "deferred": "magenta",
+    "failed": "bold red",
+    "pending": "bold red",
+}
+
 
 DEFAULT_TAG_KEYS: Tuple[str, ...] = (
     "STAGE",
@@ -155,12 +191,71 @@ def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def write_out(message: str) -> None:
+    if STDOUT_CONSOLE is not None:
+        STDOUT_CONSOLE.print(message, markup=False, highlight=False)
+        return
+    print(message)
+
+
+def write_err(message: str) -> None:
+    if STDERR_CONSOLE is not None:
+        STDERR_CONSOLE.print(message, markup=False, highlight=False)
+        return
+    print(message, file=sys.stderr)
+
+
 def log(message: str) -> None:
-    print(f"[{now_str()}] {message}")
+    write_out(f"[{now_str()}] {message}")
 
 
 def warn(message: str) -> None:
-    print(f"[{now_str()}] WARN: {message}", file=sys.stderr)
+    write_err(f"[{now_str()}] WARN: {message}")
+
+
+def print_status_line(task: DeletionTask, result: DeletionResult) -> None:
+    line = f"[{result.status.upper():8}] {task.resource_type} [{task.region}] {task.resource_key} | {result.message}"
+    if STDOUT_CONSOLE is not None and RICH_UI:
+        STDOUT_CONSOLE.print(line, style=STATUS_STYLES.get(result.status, "white"), markup=False, highlight=False)
+        return
+    print(line)
+
+
+def print_pending_line(task: DeletionTask) -> None:
+    line = f"  [pending] {task.resource_type} [{task.region}] {task.resource_key}"
+    if STDOUT_CONSOLE is not None and RICH_UI:
+        STDOUT_CONSOLE.print(line, style=STATUS_STYLES["pending"], markup=False, highlight=False)
+        return
+    print(line)
+
+
+def print_type_breakdown(rows: Sequence[Tuple[str, int]]) -> None:
+    if STDOUT_CONSOLE is not None and RICH_UI and Table is not None:
+        table = Table(title="Matched Resource Types", header_style="bold cyan")
+        table.add_column("Resource Type", style="white")
+        table.add_column("Count", justify="right", style="bold")
+        for resource_type, count in rows:
+            table.add_row(resource_type, str(count))
+        STDOUT_CONSOLE.print(table)
+        return
+
+    for resource_type, count in rows:
+        print(f"  {resource_type}: {count}")
+
+
+def print_stats_summary(stats: Counter[str]) -> None:
+    if STDOUT_CONSOLE is not None and RICH_UI and Table is not None:
+        table = Table(title="Deletion Summary", header_style="bold cyan")
+        table.add_column("Status", style="white")
+        table.add_column("Count", justify="right", style="bold")
+        for key in sorted(stats):
+            style = STATUS_STYLES.get(key, "white")
+            table.add_row(key, str(stats[key]), style=style)
+        STDOUT_CONSOLE.print(table)
+        return
+
+    for key in sorted(stats):
+        print(f"  {key}: {stats[key]}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1593,17 +1688,38 @@ def require_confirmation(total: int, profile: str, default_region: str, tag_valu
 
 def print_plan(tasks: Sequence[DeletionTask], unsupported: Sequence[InventoryRecord]) -> None:
     log(f"Supported resources planned: {len(tasks)}")
-    for task in tasks:
-        detail = ", ".join(f"{k}={v}" for k, v in task.payload.items())
-        print(
-            f"  [priority={task.priority:03d}] {task.resource_type} "
-            f"[{task.region}] {detail} | reason={task.match_reason}"
-        )
+    if STDOUT_CONSOLE is not None and RICH_UI and Table is not None:
+        table = Table(title="Deletion Plan", header_style="bold cyan")
+        table.add_column("Priority", justify="right", style="bold")
+        table.add_column("Type", style="white")
+        table.add_column("Region", style="white")
+        table.add_column("Target", style="white")
+        table.add_column("Reason", style="white")
+        for task in tasks:
+            detail = ", ".join(f"{k}={v}" for k, v in task.payload.items())
+            table.add_row(f"{task.priority:03d}", task.resource_type, task.region, detail, task.match_reason)
+        STDOUT_CONSOLE.print(table)
+    else:
+        for task in tasks:
+            detail = ", ".join(f"{k}={v}" for k, v in task.payload.items())
+            print(
+                f"  [priority={task.priority:03d}] {task.resource_type} "
+                f"[{task.region}] {detail} | reason={task.match_reason}"
+            )
 
     if unsupported:
         log(f"Matched but unsupported resource types: {len(unsupported)}")
-        for item in unsupported:
-            print(f"  [skip] {item.resource_type} [{item.region}] {item.resource_key}")
+        if STDOUT_CONSOLE is not None and RICH_UI and Table is not None:
+            table = Table(title="Unsupported Matched Resources", header_style="bold yellow")
+            table.add_column("Type", style="white")
+            table.add_column("Region", style="white")
+            table.add_column("Resource Key", style="white")
+            for item in unsupported:
+                table.add_row(item.resource_type, item.region, item.resource_key)
+            STDOUT_CONSOLE.print(table)
+        else:
+            for item in unsupported:
+                print(f"  [skip] {item.resource_type} [{item.region}] {item.resource_key}")
 
 
 def run_delete_rounds(
@@ -1624,28 +1740,71 @@ def run_delete_rounds(
         progressed = 0
 
         total_in_round = len(pending)
-        for task_idx, task in enumerate(pending, start=1):
-            label = f"{task.resource_type} [{task.region}] {task.resource_key}"
-            log(
-                f"Task start {task_idx}/{total_in_round} in round {round_idx}/{max_rounds}: "
-                f"{label} (handler={task.handler_name})"
+        progress = None
+        progress_task_id = None
+        if (
+            STDOUT_CONSOLE is not None
+            and RICH_UI
+            and RichProgress is not None
+            and SpinnerColumn is not None
+            and TextColumn is not None
+            and BarColumn is not None
+            and MofNCompleteColumn is not None
+            and TimeElapsedColumn is not None
+        ):
+            progress = RichProgress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]Round {task.fields[round_label]}", justify="left"),
+                BarColumn(bar_width=None),
+                MofNCompleteColumn(),
+                TextColumn("{task.fields[last_event]}", justify="left"),
+                TimeElapsedColumn(),
+                console=STDOUT_CONSOLE,
+                transient=False,
             )
-            started_at = time.monotonic()
-            handler = DELETE_HANDLERS[task.handler_name]
-            result = handler(ctx, task)
-            elapsed = time.monotonic() - started_at
-            stats[result.status] += 1
-            print(f"[{result.status.upper():8}] {task.resource_type} [{task.region}] {task.resource_key} | {result.message}")
-            log(
-                f"Task end {task_idx}/{total_in_round} in round {round_idx}/{max_rounds}: "
-                f"{label} status={result.status} duration={elapsed:.1f}s"
+            progress.start()
+            progress_task_id = progress.add_task(
+                "delete-round",
+                total=total_in_round,
+                round_label=f"{round_idx}/{max_rounds}",
+                last_event="starting",
             )
 
-            if result.status in {"deleted", "skipped", "planned"}:
-                progressed += 1
-                continue
-            if result.status == "deferred":
-                next_pending.append(task)
+        try:
+            for task_idx, task in enumerate(pending, start=1):
+                label = f"{task.resource_type} [{task.region}] {task.resource_key}"
+                log(
+                    f"Task start {task_idx}/{total_in_round} in round {round_idx}/{max_rounds}: "
+                    f"{label} (handler={task.handler_name})"
+                )
+                started_at = time.monotonic()
+                handler = DELETE_HANDLERS[task.handler_name]
+                result = handler(ctx, task)
+                elapsed = time.monotonic() - started_at
+                stats[result.status] += 1
+
+                print_status_line(task, result)
+
+                if progress is not None and progress_task_id is not None:
+                    progress.update(
+                        progress_task_id,
+                        advance=1,
+                        last_event=f"{result.status.upper()} {task_idx}/{total_in_round}",
+                    )
+
+                log(
+                    f"Task end {task_idx}/{total_in_round} in round {round_idx}/{max_rounds}: "
+                    f"{label} status={result.status} duration={elapsed:.1f}s"
+                )
+
+                if result.status in {"deleted", "skipped", "planned"}:
+                    progressed += 1
+                    continue
+                if result.status == "deferred":
+                    next_pending.append(task)
+        finally:
+            if progress is not None:
+                progress.stop()
 
         pending = next_pending
 
@@ -1659,11 +1818,10 @@ def run_delete_rounds(
     if pending:
         warn("Some resources are still pending (dependency or eventual consistency).")
         for task in pending:
-            print(f"  [pending] {task.resource_type} [{task.region}] {task.resource_key}")
+            print_pending_line(task)
 
     log("Deletion summary:")
-    for key in sorted(stats):
-        print(f"  {key}: {stats[key]}")
+    print_stats_summary(stats)
 
 
 def main() -> None:
@@ -1707,8 +1865,7 @@ def main() -> None:
 
     records_only = [record for record, _ in matched_records]
     log(f"Inventory matched resources: {len(records_only)}")
-    for resource_type, count in summarize_by_type(records_only):
-        print(f"  {resource_type}: {count}")
+    print_type_breakdown(summarize_by_type(records_only))
 
     tasks: List[DeletionTask] = []
     unsupported: List[InventoryRecord] = []
