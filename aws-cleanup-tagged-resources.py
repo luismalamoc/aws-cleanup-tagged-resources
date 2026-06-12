@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -25,7 +27,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 
 try:
     import boto3
-    from botocore.exceptions import ClientError
+    from botocore.exceptions import BotoCoreError, ClientError
 except ImportError as exc:
     print("Missing dependency: boto3. Install with: pip install -r requirements.txt", file=sys.stderr)
     raise SystemExit(1) from exc
@@ -94,6 +96,33 @@ RETRYABLE_ERROR_CODES: Set[str] = {
     "Throttling",
     "ThrottlingException",
 }
+
+AUTH_ERROR_CODES: Set[str] = {
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "InvalidClientTokenId",
+    "RequestExpired",
+    "UnrecognizedClientException",
+}
+
+AUTH_BOTOCORE_ERROR_NAMES: Set[str] = {
+    "CredentialRetrievalError",
+    "NoCredentialsError",
+    "PartialCredentialsError",
+    "SSOTokenLoadError",
+    "TokenRetrievalError",
+    "UnauthorizedSSOTokenError",
+}
+
+AUTH_ERROR_MESSAGE_HINTS: Tuple[str, ...] = (
+    "cannot refresh credentials",
+    "expired token",
+    "mfa token required",
+    "request has expired",
+    "security token included in the request is expired",
+    "security token included in the request is invalid",
+    "token retrieval",
+)
 
 GENERIC_IDENTIFIER_KEYS: Tuple[str, ...] = (
     "Arn",
@@ -372,6 +401,53 @@ def get_error_code(exc: ClientError) -> str:
     payload = exc.response.get("Error", {}) if isinstance(exc.response, dict) else {}
     code = payload.get("Code")
     return str(code) if code else "UnknownError"
+
+
+def get_error_message(exc: ClientError) -> str:
+    payload = exc.response.get("Error", {}) if isinstance(exc.response, dict) else {}
+    message = payload.get("Message")
+    return str(message) if message else ""
+
+
+def has_auth_error_hint(message: str) -> bool:
+    lowered = message.lower()
+    return any(hint in lowered for hint in AUTH_ERROR_MESSAGE_HINTS)
+
+
+def is_auth_client_error(exc: ClientError) -> bool:
+    code = get_error_code(exc)
+    if code in AUTH_ERROR_CODES:
+        return True
+    return has_auth_error_hint(get_error_message(exc))
+
+
+def is_auth_botocore_error(exc: BotoCoreError) -> bool:
+    if exc.__class__.__name__ in AUTH_BOTOCORE_ERROR_NAMES:
+        return True
+    return has_auth_error_hint(str(exc))
+
+
+def is_auth_result(result: DeletionResult) -> bool:
+    return has_auth_error_hint(result.message)
+
+
+def is_auth_exception(exc: Exception) -> bool:
+    if isinstance(exc, ClientError):
+        return is_auth_client_error(exc)
+    if isinstance(exc, BotoCoreError):
+        return is_auth_botocore_error(exc)
+    if exc.__class__.__name__ == "RefreshWithMFAUnsupportedError":
+        return True
+    return has_auth_error_hint(str(exc))
+
+
+def reason_requires_interactive_mfa(reason: str) -> bool:
+    lowered = reason.lower()
+    return (
+        "mfa token required" in lowered
+        or "cannot refresh credentials" in lowered
+        or "refreshwithmfaunsupportederror" in lowered
+    )
 
 
 def is_retryable(exc: ClientError) -> bool:
@@ -1731,6 +1807,99 @@ def run_delete_rounds(
     pending: List[DeletionTask] = list(tasks)
     stats: Counter[str] = Counter()
 
+    def try_refresh_with_aws_cli() -> bool:
+        log(f"Running AWS CLI to refresh credentials for profile '{ctx.profile}' (MFA prompt expected)")
+        command = ["aws", "sts", "get-caller-identity", "--profile", ctx.profile, "--region", ctx.default_region]
+        tty_stream = None
+        try:
+            try:
+                tty_stream = open("/dev/tty", "r+", encoding="utf-8", errors="ignore")
+            except OSError:
+                tty_stream = None
+
+            run_env = dict(os.environ)
+            run_env["AWS_PAGER"] = ""
+            run_kwargs: Dict[str, Any] = {"check": True, "env": run_env}
+            if tty_stream is not None:
+                run_kwargs.update({"stdin": tty_stream, "stdout": tty_stream, "stderr": tty_stream})
+
+            subprocess.run(command, **run_kwargs)
+        except FileNotFoundError:
+            warn("AWS CLI is not installed or not in PATH; cannot trigger interactive MFA refresh")
+            return False
+        except subprocess.CalledProcessError as exc:
+            warn(f"AWS CLI credential refresh failed with exit code {exc.returncode}")
+            return False
+        finally:
+            if tty_stream is not None:
+                tty_stream.close()
+        return True
+
+    def refresh_session_with_mfa(reason: str) -> bool:
+        warn(
+            "AWS session appears expired/invalid. "
+            f"Reason: {reason}. Re-authenticating profile '{ctx.profile}' (MFA may be requested)."
+        )
+        if reason_requires_interactive_mfa(reason):
+            warn("Detected MFA-required refresh. Prompting for MFA interactively now.")
+            if not try_refresh_with_aws_cli():
+                return False
+
+        try:
+            ctx.session = boto3.Session(profile_name=ctx.profile)
+            ctx.clients.clear()
+        except Exception as exc:
+            warn(f"Failed to rebuild boto3 session after MFA refresh: {exc}")
+            return False
+
+        log("AWS session refreshed and cached clients were reset")
+        return True
+
+    def execute_task_with_auth_retry(
+        task: DeletionTask,
+        handler: Callable[[DeleteContext, DeletionTask], DeletionResult],
+    ) -> DeletionResult:
+        refreshed = False
+
+        while True:
+            try:
+                result = handler(ctx, task)
+            except ClientError as exc:
+                if not is_auth_client_error(exc):
+                    raise
+                if refreshed:
+                    return make_result("failed", f"Authentication retry failed: {get_error_code(exc)}")
+                if not refresh_session_with_mfa(f"{get_error_code(exc)} {get_error_message(exc)}".strip()):
+                    return make_result("failed", f"Authentication refresh failed: {get_error_code(exc)}")
+                refreshed = True
+                continue
+            except BotoCoreError as exc:
+                if not is_auth_botocore_error(exc):
+                    raise
+                if refreshed:
+                    return make_result("failed", f"Authentication retry failed: {exc}")
+                if not refresh_session_with_mfa(str(exc)):
+                    return make_result("failed", f"Authentication refresh failed: {exc}")
+                refreshed = True
+                continue
+            except Exception as exc:
+                if not is_auth_exception(exc):
+                    raise
+                if refreshed:
+                    return make_result("failed", f"Authentication retry failed: {exc.__class__.__name__}")
+                if not refresh_session_with_mfa(str(exc)):
+                    return make_result("failed", f"Authentication refresh failed: {exc.__class__.__name__}")
+                refreshed = True
+                continue
+
+            if not is_auth_result(result):
+                return result
+            if refreshed:
+                return make_result("failed", f"{result.message} (authentication retry failed)")
+            if not refresh_session_with_mfa(result.message):
+                return make_result("failed", f"{result.message} (could not refresh AWS session)")
+            refreshed = True
+
     for round_idx in range(1, max_rounds + 1):
         if not pending:
             break
@@ -1779,7 +1948,11 @@ def run_delete_rounds(
                 )
                 started_at = time.monotonic()
                 handler = DELETE_HANDLERS[task.handler_name]
-                result = handler(ctx, task)
+                try:
+                    result = execute_task_with_auth_retry(task, handler)
+                except Exception as exc:
+                    warn(f"Unhandled exception while deleting {label}: {exc}")
+                    result = make_result("failed", f"Unhandled exception: {exc.__class__.__name__}")
                 elapsed = time.monotonic() - started_at
                 stats[result.status] += 1
 
