@@ -27,6 +27,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 
 try:
     import boto3
+    from botocore.config import Config
+    from botocore.credentials import JSONFileCache
     from botocore.exceptions import BotoCoreError, ClientError
 except ImportError as exc:
     print("Missing dependency: boto3. Install with: pip install -r requirements.txt", file=sys.stderr)
@@ -67,6 +69,12 @@ STATUS_STYLES: Dict[str, str] = {
     "failed": "bold red",
     "pending": "bold red",
 }
+
+AWS_CLIENT_CONFIG = Config(
+    connect_timeout=10,
+    read_timeout=30,
+    retries={"max_attempts": 3, "mode": "standard"},
+)
 
 
 DEFAULT_TAG_KEYS: Tuple[str, ...] = (
@@ -117,7 +125,9 @@ AUTH_BOTOCORE_ERROR_NAMES: Set[str] = {
 AUTH_ERROR_MESSAGE_HINTS: Tuple[str, ...] = (
     "cannot refresh credentials",
     "expired token",
+    "invalid length for parameter tokencode",
     "mfa token required",
+    "parameter tokencode",
     "request has expired",
     "security token included in the request is expired",
     "security token included in the request is invalid",
@@ -212,7 +222,11 @@ class DeleteContext:
         target_region = region or self.default_region
         cache_key = f"{service_name}@{target_region}"
         if cache_key not in self.clients:
-            self.clients[cache_key] = self.session.client(service_name, region_name=target_region)
+            self.clients[cache_key] = self.session.client(
+                service_name,
+                region_name=target_region,
+                config=AWS_CLIENT_CONFIG,
+            )
         return self.clients[cache_key]
 
 
@@ -448,6 +462,18 @@ def reason_requires_interactive_mfa(reason: str) -> bool:
         or "cannot refresh credentials" in lowered
         or "refreshwithmfaunsupportederror" in lowered
     )
+
+
+def create_boto3_session(profile: str) -> Any:
+    session = boto3.Session(profile_name=profile)
+    try:
+        provider_chain = session._session.get_component("credential_provider")
+        assume_role_provider = provider_chain.get_provider("assume-role")
+        if assume_role_provider is not None:
+            assume_role_provider.cache = JSONFileCache(str(Path.home() / ".aws" / "cli" / "cache"))
+    except Exception as exc:
+        warn(f"Could not attach AWS CLI credential cache to boto3 session: {exc}")
+    return session
 
 
 def is_retryable(exc: ClientError) -> bool:
@@ -1599,7 +1625,7 @@ def delete_s3_bucket(ctx: DeleteContext, task: DeletionTask) -> DeletionResult:
 def wait_cloudcontrol_delete(
     cloudcontrol: Any,
     request_token: str,
-    timeout_seconds: int = 180,
+    timeout_seconds: int = 60,
     poll_seconds: int = 5,
     progress_interval_seconds: int = 0,
     progress_label: str = "",
@@ -1806,12 +1832,20 @@ def run_delete_rounds(
 ) -> None:
     pending: List[DeletionTask] = list(tasks)
     stats: Counter[str] = Counter()
+    active_progress: Optional[Any] = None
+    interactive_mfa_refresh_attempted = False
 
     def try_refresh_with_aws_cli() -> bool:
         log(f"Running AWS CLI to refresh credentials for profile '{ctx.profile}' (MFA prompt expected)")
         command = ["aws", "sts", "get-caller-identity", "--profile", ctx.profile, "--region", ctx.default_region]
         tty_stream = None
+        paused_progress = False
         try:
+            if active_progress is not None:
+                active_progress.stop()
+                paused_progress = True
+                write_out("")
+
             try:
                 tty_stream = open("/dev/tty", "r+", encoding="utf-8", errors="ignore")
             except OSError:
@@ -1833,20 +1867,27 @@ def run_delete_rounds(
         finally:
             if tty_stream is not None:
                 tty_stream.close()
+            if paused_progress and active_progress is not None:
+                active_progress.start()
         return True
 
     def refresh_session_with_mfa(reason: str) -> bool:
+        nonlocal interactive_mfa_refresh_attempted
         warn(
             "AWS session appears expired/invalid. "
             f"Reason: {reason}. Re-authenticating profile '{ctx.profile}' (MFA may be requested)."
         )
         if reason_requires_interactive_mfa(reason):
+            if interactive_mfa_refresh_attempted:
+                warn("MFA refresh was already attempted in this run. Skipping another prompt and continuing to summary.")
+                return False
+            interactive_mfa_refresh_attempted = True
             warn("Detected MFA-required refresh. Prompting for MFA interactively now.")
             if not try_refresh_with_aws_cli():
                 return False
 
         try:
-            ctx.session = boto3.Session(profile_name=ctx.profile)
+            ctx.session = create_boto3_session(ctx.profile)
             ctx.clients.clear()
         except Exception as exc:
             warn(f"Failed to rebuild boto3 session after MFA refresh: {exc}")
@@ -1868,36 +1909,36 @@ def run_delete_rounds(
                 if not is_auth_client_error(exc):
                     raise
                 if refreshed:
-                    return make_result("failed", f"Authentication retry failed: {get_error_code(exc)}")
+                    return make_result("failed", f"Authentication still required after MFA refresh: {get_error_code(exc)}")
                 if not refresh_session_with_mfa(f"{get_error_code(exc)} {get_error_message(exc)}".strip()):
-                    return make_result("failed", f"Authentication refresh failed: {get_error_code(exc)}")
+                    return make_result("failed", f"Authentication refresh unavailable: {get_error_code(exc)}")
                 refreshed = True
                 continue
             except BotoCoreError as exc:
                 if not is_auth_botocore_error(exc):
                     raise
                 if refreshed:
-                    return make_result("failed", f"Authentication retry failed: {exc}")
+                    return make_result("failed", f"Authentication still required after MFA refresh: {exc.__class__.__name__}")
                 if not refresh_session_with_mfa(str(exc)):
-                    return make_result("failed", f"Authentication refresh failed: {exc}")
+                    return make_result("failed", f"Authentication refresh unavailable: {exc.__class__.__name__}")
                 refreshed = True
                 continue
             except Exception as exc:
                 if not is_auth_exception(exc):
                     raise
                 if refreshed:
-                    return make_result("failed", f"Authentication retry failed: {exc.__class__.__name__}")
+                    return make_result("failed", f"Authentication still required after MFA refresh: {exc.__class__.__name__}")
                 if not refresh_session_with_mfa(str(exc)):
-                    return make_result("failed", f"Authentication refresh failed: {exc.__class__.__name__}")
+                    return make_result("failed", f"Authentication refresh unavailable: {exc.__class__.__name__}")
                 refreshed = True
                 continue
 
             if not is_auth_result(result):
                 return result
             if refreshed:
-                return make_result("failed", f"{result.message} (authentication retry failed)")
+                return make_result("failed", f"{result.message} (authentication still required after MFA refresh)")
             if not refresh_session_with_mfa(result.message):
-                return make_result("failed", f"{result.message} (could not refresh AWS session)")
+                return make_result("failed", f"{result.message} (authentication refresh unavailable)")
             refreshed = True
 
     for round_idx in range(1, max_rounds + 1):
@@ -1932,6 +1973,7 @@ def run_delete_rounds(
                 transient=False,
             )
             progress.start()
+            active_progress = progress
             progress_task_id = progress.add_task(
                 "delete-round",
                 total=total_in_round,
@@ -1978,6 +2020,8 @@ def run_delete_rounds(
         finally:
             if progress is not None:
                 progress.stop()
+                if active_progress is progress:
+                    active_progress = None
 
         pending = next_pending
 
@@ -2056,7 +2100,7 @@ def main() -> None:
         log("No supported resources to delete after filtering. Nothing to do.")
         return
 
-    session = boto3.Session(profile_name=args.profile)
+    session = create_boto3_session(args.profile)
     ctx = DeleteContext(
         session=session,
         profile=args.profile,
