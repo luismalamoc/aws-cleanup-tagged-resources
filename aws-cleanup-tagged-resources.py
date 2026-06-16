@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -210,12 +211,24 @@ class DeletionResult:
 
 
 @dataclass
+class CloudFormationExportDependency:
+    region: str
+    exporting_stack_id: str
+    exporting_stack_name: str
+    export_name: str
+    export_value: str
+    imports: List[str]
+    planned_imports: List[str]
+
+
+@dataclass
 class DeleteContext:
     session: Any
     profile: str
     default_region: str
     dry_run: bool
     cloudcontrol_progress_seconds: int
+    cloudformation_blocked_stacks: Set[str]
     clients: Dict[str, Any]
 
     def client(self, service_name: str, region: str) -> Any:
@@ -708,6 +721,247 @@ def pick_first(props: Dict[str, Any], *keys: str, default: str = "") -> str:
         if value:
             return value
     return default
+
+
+def parse_json_list(raw: str) -> List[str]:
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(values, list):
+        return []
+    return [get_string(item).strip() for item in values if get_string(item).strip()]
+
+
+def task_identifiers(task: DeletionTask) -> List[str]:
+    return parse_json_list(task.payload.get("identifiers_json", "[]"))
+
+
+def cloudformation_stack_name(identifier: str) -> str:
+    marker = ":stack/"
+    if marker in identifier:
+        suffix = identifier.split(marker, 1)[1]
+        return suffix.split("/", 1)[0]
+    return identifier.split("/", 1)[0]
+
+
+def planned_cloudformation_stacks(tasks: Sequence[DeletionTask]) -> Dict[str, Dict[str, Set[str]]]:
+    planned: Dict[str, Dict[str, Set[str]]] = {}
+    for task in tasks:
+        if task.resource_type != "AWS::CloudFormation::Stack":
+            continue
+        region = task.region or ""
+        region_planned = planned.setdefault(region, {"ids": set(), "names": set()})
+        for identifier in task_identifiers(task) or [task.resource_key]:
+            region_planned["ids"].add(identifier)
+            region_planned["names"].add(cloudformation_stack_name(identifier))
+    return planned
+
+
+def list_cloudformation_imports(cloudformation: Any, export_name: str) -> List[str]:
+    imports: List[str] = []
+    token = ""
+    while True:
+        kwargs = {"ExportName": export_name}
+        if token:
+            kwargs["NextToken"] = token
+        try:
+            response = cloudformation.list_imports(**kwargs)
+        except ClientError as exc:
+            code = get_error_code(exc)
+            message = get_error_message(exc).lower()
+            if code == "ValidationError" and "not imported" in message:
+                return imports
+            raise
+        imports.extend(get_string(item).strip() for item in response.get("Imports", []) if get_string(item).strip())
+        token = get_string(response.get("NextToken", "")).strip()
+        if not token:
+            return imports
+
+
+def collect_cloudformation_export_dependencies(
+    ctx: DeleteContext,
+    tasks: Sequence[DeletionTask],
+) -> List[CloudFormationExportDependency]:
+    planned = planned_cloudformation_stacks(tasks)
+    dependencies: List[CloudFormationExportDependency] = []
+
+    for region, identifiers in sorted(planned.items()):
+        cloudformation = ctx.client("cloudformation", region or ctx.default_region)
+        token = ""
+        while True:
+            kwargs: Dict[str, str] = {}
+            if token:
+                kwargs["NextToken"] = token
+            response = cloudformation.list_exports(**kwargs)
+
+            for export in response.get("Exports", []):
+                exporting_stack_id = get_string(export.get("ExportingStackId", "")).strip()
+                exporting_stack_name = cloudformation_stack_name(exporting_stack_id)
+                if exporting_stack_id not in identifiers["ids"] and exporting_stack_name not in identifiers["names"]:
+                    continue
+
+                export_name = get_string(export.get("Name", "")).strip()
+                if not export_name:
+                    continue
+
+                try:
+                    imports = list_cloudformation_imports(cloudformation, export_name)
+                except ClientError as exc:
+                    warn(f"Could not list imports for CloudFormation export {export_name}: {get_error_code(exc)}")
+                    continue
+                if not imports:
+                    continue
+
+                planned_imports = [item for item in imports if item in identifiers["names"]]
+                dependencies.append(
+                    CloudFormationExportDependency(
+                        region=region or ctx.default_region,
+                        exporting_stack_id=exporting_stack_id,
+                        exporting_stack_name=exporting_stack_name,
+                        export_name=export_name,
+                        export_value=get_string(export.get("Value", "")).strip(),
+                        imports=imports,
+                        planned_imports=planned_imports,
+                    )
+                )
+
+            token = get_string(response.get("NextToken", "")).strip()
+            if not token:
+                break
+
+    return dependencies
+
+
+def print_cloudformation_dependency_graph(dependencies: Sequence[CloudFormationExportDependency]) -> None:
+    if not dependencies:
+        log("No CloudFormation export/import blockers found for planned stacks.")
+        return
+
+    warn(
+        "CloudFormation export/import blockers found. "
+        "Stacks with active imports will be deferred instead of deleted."
+    )
+    if STDOUT_CONSOLE is not None and RICH_UI and Table is not None:
+        table = Table(title="CloudFormation Export Dependency Graph", header_style="bold magenta")
+        table.add_column("Region", style="white")
+        table.add_column("Exporter", style="cyan", overflow="fold")
+        table.add_column("Export", style="white", overflow="fold")
+        table.add_column("Imported By", style="yellow", overflow="fold")
+        table.add_column("Planned Importers", style="magenta", overflow="fold")
+        for dependency in dependencies:
+            table.add_row(
+                dependency.region,
+                dependency.exporting_stack_name,
+                dependency.export_name,
+                ", ".join(dependency.imports),
+                ", ".join(dependency.planned_imports) or "-",
+            )
+        STDOUT_CONSOLE.print(table)
+        return
+
+    print("CloudFormation export dependency graph:")
+    for dependency in dependencies:
+        planned = ", ".join(dependency.planned_imports) or "-"
+        print(
+            f"  {dependency.region}: {dependency.exporting_stack_name} exports {dependency.export_name} "
+            f"-> imported by {', '.join(dependency.imports)} (planned importers: {planned})"
+        )
+
+
+def mark_cloudformation_blocked_stacks(
+    ctx: DeleteContext,
+    dependencies: Sequence[CloudFormationExportDependency],
+) -> None:
+    for dependency in dependencies:
+        ctx.cloudformation_blocked_stacks.add(dependency.exporting_stack_id)
+        ctx.cloudformation_blocked_stacks.add(dependency.exporting_stack_name)
+
+
+def split_cloudformation_stack_tasks(
+    tasks: Sequence[DeletionTask],
+) -> Tuple[List[DeletionTask], List[DeletionTask]]:
+    cloudformation_tasks: List[DeletionTask] = []
+    other_tasks: List[DeletionTask] = []
+    for task in tasks:
+        if task.resource_type == "AWS::CloudFormation::Stack":
+            cloudformation_tasks.append(task)
+        else:
+            other_tasks.append(task)
+    return cloudformation_tasks, other_tasks
+
+
+def cloudformation_stack_identifiers(tasks: Sequence[DeletionTask]) -> List[str]:
+    identifiers: List[str] = []
+    seen: Set[str] = set()
+    for task in tasks:
+        candidates = task_identifiers(task) or [task.resource_key]
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            identifiers.append(candidate)
+    return identifiers
+
+
+def run_cloudformation_teardown_helper(
+    profile: str,
+    region: str,
+    stack_tasks: Sequence[DeletionTask],
+    apply: bool,
+    allow_non_dev_profile: bool,
+    max_rounds: int,
+    round_wait_seconds: int,
+) -> bool:
+    identifiers = cloudformation_stack_identifiers(stack_tasks)
+    if not identifiers:
+        return True
+
+    helper_path = Path(__file__).with_name("aws-teardown-cloudformation-graph.py")
+    if not helper_path.exists():
+        warn(f"CloudFormation teardown helper not found: {helper_path}")
+        return False
+
+    payload = {"stacks": identifiers}
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
+        json.dump(payload, handle)
+        stacks_path = Path(handle.name)
+
+    command = [
+        sys.executable,
+        str(helper_path),
+        "--profile",
+        profile,
+        "--region",
+        region,
+        "--stacks-json",
+        str(stacks_path),
+        "--max-rounds",
+        str(max(1, max_rounds)),
+        "--round-wait-seconds",
+        str(max(0, round_wait_seconds)),
+    ]
+    if apply:
+        command.extend(["--apply", "--force"])
+    if allow_non_dev_profile:
+        command.append("--allow-non-dev-profile")
+
+    log(
+        "Delegating "
+        f"{len(identifiers)} CloudFormation stack(s) to {helper_path.name} "
+        f"({'apply' if apply else 'dry-run'})"
+    )
+    try:
+        completed = subprocess.run(command, check=False)
+    finally:
+        try:
+            stacks_path.unlink()
+        except OSError:
+            pass
+    if completed.returncode != 0:
+        warn(f"CloudFormation teardown helper exited with code {completed.returncode}")
+        return False
+    return True
 
 
 def parse_cluster_service_from_arn(service_arn: str) -> Tuple[str, str]:
@@ -1661,17 +1915,19 @@ def wait_cloudcontrol_delete(
 
 def delete_generic_resource(ctx: DeleteContext, task: DeletionTask) -> DeletionResult:
     type_name = task.payload["type_name"]
-    identifiers_raw = task.payload.get("identifiers_json", "[]")
-    try:
-        identifiers = json.loads(identifiers_raw)
-    except json.JSONDecodeError:
-        identifiers = []
-    if not isinstance(identifiers, list):
-        identifiers = []
-    identifiers = [get_string(item).strip() for item in identifiers if get_string(item).strip()]
+    identifiers = task_identifiers(task)
 
     if not identifiers:
         return make_result("failed", f"No candidate identifiers found for {type_name}")
+
+    if type_name == "AWS::CloudFormation::Stack":
+        for identifier in identifiers:
+            stack_name = cloudformation_stack_name(identifier)
+            if identifier in ctx.cloudformation_blocked_stacks or stack_name in ctx.cloudformation_blocked_stacks:
+                return make_result(
+                    "deferred",
+                    f"CloudFormation stack {stack_name} has active export imports; see dependency graph above",
+                )
 
     if ctx.dry_run:
         preview = identifiers[0]
@@ -2107,6 +2363,7 @@ def main() -> None:
         default_region=args.region,
         dry_run=not args.apply,
         cloudcontrol_progress_seconds=max(0, args.cloudcontrol_progress_seconds),
+        cloudformation_blocked_stacks=set(),
         clients={},
     )
 
@@ -2119,25 +2376,55 @@ def main() -> None:
     log(f"Match mode: {args.match_mode}")
     log(f"Mode: {'apply' if args.apply else 'dry-run'}")
 
+    cloudformation_tasks, non_cloudformation_tasks = split_cloudformation_stack_tasks(tasks)
+
     if not args.apply:
-        run_delete_rounds(
-            ctx=ctx,
-            tasks=tasks,
-            max_rounds=1,
-            round_wait_seconds=0,
+        run_cloudformation_teardown_helper(
+            profile=args.profile,
+            region=args.region,
+            stack_tasks=cloudformation_tasks,
+            apply=False,
+            allow_non_dev_profile=args.allow_non_dev_profile,
+            max_rounds=max(1, args.max_rounds),
+            round_wait_seconds=max(0, args.round_wait_seconds),
         )
+        if non_cloudformation_tasks:
+            run_delete_rounds(
+                ctx=ctx,
+                tasks=non_cloudformation_tasks,
+                max_rounds=1,
+                round_wait_seconds=0,
+            )
+        else:
+            log("No non-CloudFormation resources to process in the main deletion rounds.")
         log("Dry-run complete. Re-run with --apply to execute deletions.")
         return
 
     if not args.force:
         require_confirmation(len(tasks), args.profile, args.region, args.tag_value, input_path)
 
-    run_delete_rounds(
-        ctx=ctx,
-        tasks=tasks,
+    helper_ok = run_cloudformation_teardown_helper(
+        profile=args.profile,
+        region=args.region,
+        stack_tasks=cloudformation_tasks,
+        apply=True,
+        allow_non_dev_profile=args.allow_non_dev_profile,
         max_rounds=max(1, args.max_rounds),
         round_wait_seconds=max(0, args.round_wait_seconds),
     )
+    if not helper_ok:
+        warn("Stopping after CloudFormation teardown helper failure.")
+        return
+
+    if non_cloudformation_tasks:
+        run_delete_rounds(
+            ctx=ctx,
+            tasks=non_cloudformation_tasks,
+            max_rounds=max(1, args.max_rounds),
+            round_wait_seconds=max(0, args.round_wait_seconds),
+        )
+    else:
+        log("No non-CloudFormation resources to process in the main deletion rounds.")
 
 
 if __name__ == "__main__":
