@@ -67,6 +67,10 @@ The script expects an inventory file with a structure similar to:
 Use this when CloudFormation stacks are tagged with a stage value and export/import
 dependencies block normal stack deletion. Dry-run first:
 
+The main script `aws-cleanup-tagged-resources.py` runs independently and no longer
+delegates automatically to this helper. Use this helper only when CloudFormation
+stacks remain blocked by export/import dependencies.
+
 ```bash
 python3 aws-teardown-cloudformation-graph.py \
   --profile catalytic-pc-dev \

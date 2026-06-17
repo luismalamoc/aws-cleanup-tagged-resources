@@ -2109,6 +2109,7 @@ def run_delete_rounds(
     stats: Counter[str] = Counter()
     active_progress: Optional[Any] = None
     interactive_mfa_refresh_attempted = False
+    cloudformation_had_failures = False
 
     def try_refresh_with_aws_cli() -> bool:
         log(f"Running AWS CLI to refresh credentials for profile '{ctx.profile}' (MFA prompt expected)")
@@ -2270,6 +2271,11 @@ def run_delete_rounds(
                 except Exception as exc:
                     warn(f"Unhandled exception while deleting {label}: {exc}")
                     result = make_result("failed", f"Unhandled exception: {exc.__class__.__name__}")
+                if (
+                    task.resource_type == "AWS::CloudFormation::Stack"
+                    and result.status in {"deferred", "failed"}
+                ):
+                    cloudformation_had_failures = True
                 elapsed = time.monotonic() - started_at
                 stats[result.status] += 1
 
@@ -2314,6 +2320,13 @@ def run_delete_rounds(
 
     log("Deletion summary:")
     print_stats_summary(stats)
+
+    if cloudformation_had_failures:
+        warn(
+            "Some CloudFormation stacks were not deleted in this run. "
+            "For export/import dependency teardown, try aws-teardown-cloudformation-graph.py "
+            "with the same profile/region/tag filters."
+        )
 
 
 def main() -> None:
@@ -2399,57 +2412,25 @@ def main() -> None:
     log(f"Match mode: {args.match_mode}")
     log(f"Mode: {'apply' if args.apply else 'dry-run'}")
 
-    cloudformation_tasks, non_cloudformation_tasks = split_cloudformation_stack_tasks(tasks)
-
     if not args.apply:
-        run_cloudformation_teardown_helper(
-            profile=args.profile,
-            region=args.region,
-            stack_tasks=cloudformation_tasks,
-            apply=False,
-            allow_non_dev_profile=args.allow_non_dev_profile,
-            protected_account_ids=sorted(protected_account_ids),
-            max_rounds=max(1, args.max_rounds),
-            round_wait_seconds=max(0, args.round_wait_seconds),
+        run_delete_rounds(
+            ctx=ctx,
+            tasks=tasks,
+            max_rounds=1,
+            round_wait_seconds=0,
         )
-        if non_cloudformation_tasks:
-            run_delete_rounds(
-                ctx=ctx,
-                tasks=non_cloudformation_tasks,
-                max_rounds=1,
-                round_wait_seconds=0,
-            )
-        else:
-            log("No non-CloudFormation resources to process in the main deletion rounds.")
         log("Dry-run complete. Re-run with --apply to execute deletions.")
         return
 
     if not args.force:
         require_confirmation(len(tasks), args.profile, args.region, args.tag_value, input_path)
 
-    helper_ok = run_cloudformation_teardown_helper(
-        profile=args.profile,
-        region=args.region,
-        stack_tasks=cloudformation_tasks,
-        apply=True,
-        allow_non_dev_profile=args.allow_non_dev_profile,
-        protected_account_ids=sorted(protected_account_ids),
+    run_delete_rounds(
+        ctx=ctx,
+        tasks=tasks,
         max_rounds=max(1, args.max_rounds),
         round_wait_seconds=max(0, args.round_wait_seconds),
     )
-    if not helper_ok:
-        warn("Stopping after CloudFormation teardown helper failure.")
-        return
-
-    if non_cloudformation_tasks:
-        run_delete_rounds(
-            ctx=ctx,
-            tasks=non_cloudformation_tasks,
-            max_rounds=max(1, args.max_rounds),
-            round_wait_seconds=max(0, args.round_wait_seconds),
-        )
-    else:
-        log("No non-CloudFormation resources to process in the main deletion rounds.")
 
 
 if __name__ == "__main__":
