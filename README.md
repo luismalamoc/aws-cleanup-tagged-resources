@@ -62,6 +62,40 @@ The script expects an inventory file with a structure similar to:
 
 ## Usage
 
+### CloudFormation teardown by stack tag
+
+Use this when CloudFormation stacks are tagged with a stage value and export/import
+dependencies block normal stack deletion. Dry-run first:
+
+```bash
+python3 aws-teardown-cloudformation-graph.py \
+  --profile catalytic-pc-dev \
+  --region us-east-1 \
+  --tag-value staging \
+  --protected-account-id 232771951226 \
+  --break-circular-iam-import-suffix customer-key-arn
+```
+
+Apply deletion after reviewing the dry-run:
+
+```bash
+python3 aws-teardown-cloudformation-graph.py \
+  --profile catalytic-pc-dev \
+  --region us-east-1 \
+  --tag-value staging \
+  --protected-account-id 232771951226 \
+  --break-circular-iam-import-suffix customer-key-arn \
+  --apply
+```
+
+Patched templates larger than CloudFormation's inline limit are uploaded to a
+temporary S3 bucket in the target account and passed with `TemplateURL`. Override
+the bucket name with `--template-bucket` when needed.
+
+Add `--stack-name-prefix staging-` only when you intentionally want to narrow the
+target stacks by name. Leaving it out works for stacks whose names are not based
+on the tag value.
+
 ### 1) Dry-run (recommended first)
 
 ```bash
@@ -119,6 +153,7 @@ python3 aws-cleanup-tagged-resources.py \
 - `--apply`: execute deletions (otherwise dry-run)
 - `--force`: skip interactive `SURE` prompt (only with `--apply`)
 - `--allow-non-dev-profile`: disable `-dev` profile guard
+- `--protected-account-id`: optional protected AWS account ID (repeatable or comma-separated). If omitted, no account is protected
 - `--max-rounds`: retry rounds for deferred deletions (default: `4`)
 - `--round-wait-seconds`: delay between rounds (default: `20`)
 - `--disable-generic-fallback`: disable generic delete attempts for resource types without dedicated handlers

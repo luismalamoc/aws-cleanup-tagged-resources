@@ -366,6 +366,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow profile names that do not end with -dev.",
     )
+    parser.add_argument(
+        "--protected-account-id",
+        action="append",
+        default=[],
+        help=(
+            "AWS account ID to protect from execution. Can be repeated or passed as a comma-separated list. "
+            "If omitted, no account is protected."
+        ),
+    )
     parser.add_argument("--max-rounds", type=int, default=4, help="Max deletion rounds for deferred tasks.")
     parser.add_argument(
         "--round-wait-seconds",
@@ -399,6 +408,13 @@ def parse_tag_keys(raw: str) -> List[str]:
     if not keys:
         raise ValueError("At least one tag key is required")
     return keys
+
+
+def parse_protected_account_ids(values: Sequence[str]) -> Set[str]:
+    protected: Set[str] = set()
+    for raw in values:
+        protected.update(parse_csv_set(raw))
+    return protected
 
 
 def resolve_path(candidate: str, results_dir: Path, arg_name: str) -> Path:
@@ -910,6 +926,7 @@ def run_cloudformation_teardown_helper(
     stack_tasks: Sequence[DeletionTask],
     apply: bool,
     allow_non_dev_profile: bool,
+    protected_account_ids: Sequence[str],
     max_rounds: int,
     round_wait_seconds: int,
 ) -> bool:
@@ -945,6 +962,8 @@ def run_cloudformation_teardown_helper(
         command.extend(["--apply", "--force"])
     if allow_non_dev_profile:
         command.append("--allow-non-dev-profile")
+    for account_id in protected_account_ids:
+        command.extend(["--protected-account-id", account_id])
 
     log(
         "Delegating "
@@ -2369,7 +2388,11 @@ def main() -> None:
 
     sts = ctx.client("sts", args.region)
     identity = sts.get_caller_identity()
-    log(f"AWS account (caller identity): {identity.get('Account', 'unknown')}")
+    account_id = str(identity.get("Account", "unknown"))
+    protected_account_ids = parse_protected_account_ids(args.protected_account_id)
+    if account_id in protected_account_ids:
+        raise SystemExit(f"Refusing to operate on protected AWS account {account_id}")
+    log(f"AWS account (caller identity): {account_id}")
     log(f"Profile: {args.profile}")
     log(f"Default region: {args.region}")
     log(f"Tag value: {args.tag_value}")
@@ -2385,6 +2408,7 @@ def main() -> None:
             stack_tasks=cloudformation_tasks,
             apply=False,
             allow_non_dev_profile=args.allow_non_dev_profile,
+            protected_account_ids=sorted(protected_account_ids),
             max_rounds=max(1, args.max_rounds),
             round_wait_seconds=max(0, args.round_wait_seconds),
         )
@@ -2409,6 +2433,7 @@ def main() -> None:
         stack_tasks=cloudformation_tasks,
         apply=True,
         allow_non_dev_profile=args.allow_non_dev_profile,
+        protected_account_ids=sorted(protected_account_ids),
         max_rounds=max(1, args.max_rounds),
         round_wait_seconds=max(0, args.round_wait_seconds),
     )
